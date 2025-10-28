@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""
+Car_MS (external) - Laptop_1
+Port: 6001
+Usage: python car_ms.py
+"""
+from flask import Flask, request, Response
+import yaml, requests, time, uuid
+
+app = Flask("Car_MS")
+
+STORAGE_URL = "http://localhost:5003"   # Storage_MS
+CONTROLLER_URL = "http://localhost:5000"  # Controller_MS
+
+def yaml_response(obj, status=200):
+    return Response(yaml.safe_dump(obj), status=status, mimetype="application/x-yaml")
+
+@app.route("/request_car", methods=["POST"])
+def request_car():
+    """
+    Controller requests a car id. We generate/check then share with Storage_MS and ack Controller.
+    """
+    try:
+        _ = yaml.safe_load(request.data.decode() or "{}")
+    except Exception:
+        return yaml_response({"error":"invalid yaml"}, status=400)
+    car_id = "CAR-" + uuid.uuid4().hex[:8].upper()
+    payload = {"car_id": car_id, "status": "available"}
+    try:
+        r = requests.post(f"{STORAGE_URL}/store_car", data=yaml.safe_dump(payload),
+                          headers={"Content-Type":"application/x-yaml"}, timeout=5)
+    except Exception as e:
+        return yaml_response({"error":"failed to contact storage", "exception": str(e)}, status=500)
+    # ack Controller with car id
+    return yaml_response({"car_id": car_id, "status": "ok", "stored": r.status_code == 200})
+
+@app.route("/notify_delivery", methods=["POST"])
+def notify_delivery():
+    """
+    Controller notifies the car of a delivery.
+    Controller expects an ack.
+    """
+    try:
+        data = yaml.safe_load(request.data.decode() or "{}")
+    except Exception:
+        return yaml_response({"error":"invalid yaml"}, status=400)
+    print(f"[Car_MS] Received delivery notification: {data}")
+    # Acknowledge
+    return yaml_response({"car_ack": True, "received_at": time.time()})
+
+@app.route("/get_update", methods=["POST"])
+def get_update():
+    """
+    Car asks Controller for delivery update (e.g. route/status).
+    Car calls Controller /delivery_update (see Controller code).
+    """
+    try:
+        resp = requests.post(f"{CONTROLLER_URL}/get_delivery_update", data=yaml.safe_dump({}),
+                             headers={"Content-Type":"application/x-yaml"}, timeout=5)
+        return Response(resp.text, status=resp.status_code, mimetype="application/x-yaml")
+    except Exception as e:
+        return yaml_response({"error":"failed contacting controller", "exception": str(e)}, status=500)
+
+if __name__ == "__main__":
+    print("Starting Car_MS on port 6001")
+    app.run(host="0.0.0.0", port=6001)
+

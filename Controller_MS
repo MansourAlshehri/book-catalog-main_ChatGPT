@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""
+Controller_MS (internal) - Server_1
+Port: 5000
+Usage: python controller_ms.py
+"""
+from flask import Flask, request, Response
+import yaml, requests, time
+
+app = Flask("Controller_MS")
+
+IDGEN_URL = "http://localhost:5002"
+STORAGE_URL = "http://localhost:5003"
+CAR_URL = "http://localhost:6001"
+LOG_URL = "http://localhost:5004"
+UI_URL = "http://localhost:5001"
+
+def yaml_response(obj, status=200):
+    return Response(yaml.safe_dump(obj), status=status, mimetype="application/x-yaml")
+
+def send_log(service, message):
+    try:
+        requests.post(f"{LOG_URL}/log", data=yaml.safe_dump({"service": service, "message": message}),
+                      headers={"Content-Type":"application/x-yaml"}, timeout=3)
+    except Exception as e:
+        print("[Controller_MS] failed to send log:", e)
+
+@app.route("/request_delivery", methods=["POST"])
+def request_delivery():
+    """
+    Orchestration entry point when UI forwards a sender request.
+    Flow implements:
+    - request parcel id from IDGen_MS
+    - request car id from Car_MS
+    - fetch ids back from Storage_MS when needed
+    - store delivery in Storage (Database_1)
+    - notify Car -> UI -> Sender and log at steps
+    """
+    try:
+        req = yaml.safe_load(request.data.decode() or "{}")
+    except Exception:
+        return yaml_response({"error": "invalid yaml"}, status=400)
+    send_log("Controller_MS", f"received request: {req}")
+
+    # 1) Request parcel id from IDGen_MS
+    try:
+        r = requests.post(f"{IDGEN_URL}/generate_id", data=yaml.safe_dump({"meta": req.get("parcel", {})}),
+                          headers={"Content-Type":"application/x-yaml"}, timeout=5)
+        if r.status_code != 200:
+            send_log("Controller_MS", "idgen failed")
+            return yaml_response({"error":"idgen failed", "detail": r.text}, status=500)
+        parcel_resp = yaml.safe_load(r.text)
+        parcel_id = parcel_resp.get("parcel_id")
+    except Exception as e:
+        send_log("Controller_MS", f"idgen exception: {e}")
+        return yaml_response({"error":"idgen exception", "exception": str(e)}, status=500)
+
+    send_log("Controller_MS", f"obtained parcel_id {parcel_id}")
+
+    # 2) Request car id from Car_MS
+    try:
+        r = requests.post(f"{CAR_URL}/request_car", data=yaml.safe_dump({}), headers={"Content-Type":"application/x-yaml"}, timeout=5)
+        if r.status_code != 200:
+            send_log("Controller_MS", "car request failed")
+            return yaml_response({"error":"car request failed", "detail": r.text}, status=500)
+        car_resp = yaml.safe_load(r.text)
+        car_id = car_resp.get("car_id")
+    except Exception as e:
+        send_log("Controller_MS", f"car exception: {e}")
+        return yaml_response({"error":"car exception", "exception": str(e)}, status=500)
+
+    send_log("Controller_MS", f"obtained car_id {car_id}")
+
+    # 3) Optionally re-query Storage for stored IDs (following your described sequence)
+    try:
+        r = requests.post(f"{STORAGE_URL}/get_parcel_id", data=yaml.safe_dump({}), headers={"Content-Type":"application/x-yaml"}, timeout=5)
+        stored_parcel = yaml.safe_load(r.text).get("parcel_id")
+        r2 = requests.post(f"{STORAGE_URL}/get_car_id", data=yaml.safe_dump({}), headers={"Content-Type":"application/x-yaml"}, timeout=5)
+        stored_car = yaml.safe_load(r2.text).get("car_id")
+    except Exception as e:
+        send_log("Controller_MS", f"storage fetch exception: {e}")
+        return yaml_response({"error":"storage fetch exception", "exception": str(e)}, status=500)
+
+    # 4) Assign delivery -> ask Storage to store in Database_1
+    delivery = {"parcel_id": stored_parcel or parcel_id, "car_id": stored_car or car_id, "status": "assigned"}
+    try:
+        r = requests.post(f"{STORAGE_URL}/store_delivery", data=yaml.safe_dump(delivery),
+                          headers={"Content-Type":"application/x-yaml"}, timeout=5)
+        if r.status_code != 200:
+            send_log("Controller_MS", "failed to store delivery")
+            return yaml_response({"error":"failed to store delivery", "detail": r.text}, status=500)
+        delivery_stored = yaml.safe_load(r.text)
+    except Exception as e:
+        send_log("Controller_MS", f"store_delivery exception: {e}")
+        return yaml_response({"error":"store_delivery exception", "exception": str(e)}, status=500)
+
+    send_log("Controller_MS", f"delivery stored: {delivery_stored}")
+
+    # 5) Notify Car
+    try:
+        r = requests.post(f"{CAR_URL}/notify_delivery", data=yaml.safe_dump(delivery),
+                          headers={"Content-Type":"application/x-yaml"}, timeout=5)
+        car_ack = yaml.safe_load(r.text)
+    except Exception as e:
+        send_log("Controller_MS", f"notify car exception: {e}")
+        car_ack = {"error": str(e)}
+    send_log("Controller_MS", f"car ack: {car_ack}")
+
+    # 6) Notify UI (and via UI -> Sender)
+    try:
+        r = requests.post(f"{UI_URL}/notify", data=yaml.safe_dump({"delivery": delivery}),
+                          headers={"Content-Type":"application/x-yaml"}, timeout=5)
+        ui_ack = yaml.safe_load(r.text)
+    except Exception as e:
+        send_log("Controller_MS", f"notify ui exception: {e}")
+        ui_ack = {"error": str(e)}
+
+    send_log("Controller_MS", f"ui ack: {ui_ack}")
+
+    # final ack to UI_MS caller
+    response = {
+        "assigned": True,
+        "delivery_record": delivery_stored,
+        "car_ack": car_ack,
+        "ui_ack": ui_ack
+    }
+    send_log("Controller_MS", f"assignment complete for parcel {parcel_id}")
+    return yaml_response(response)
+
+@app.route("/get_delivery_update", methods=["POST"])
+def get_delivery_update():
+    """
+    Car calls this endpoint to ask for updates. Controller will then share update with Storage and UI and logs.
+    For simplicity: Controller acknowledges, then updates Storage, and returns current delivery info.
+    """
+    try:
+        req = yaml.safe_load(request.data.decode() or "{}")
+    except Exception:
+        return yaml_response({"error": "invalid yaml"}, status=400)
+
+    send_log("Controller_MS", "Car requested delivery update")
+    # ack Car immediately
+    ack = {"controller_ack": True, "time": time.time()}
+
+    # For demo, obtain latest delivery from Storage, then update status to 'in_transit' and persist
+    try:
+        # fetch latest delivery by reading DB via Storage (we do not have fetch endpoint; assume last stored)
+        # We'll perform a naive update by instructing Storage to update delivery_id 1 (simplify)
+        # In real system you'd look up by parcel or car.
+        update_payload = {"delivery_id": 1, "status": "in_transit"}
+        r = requests.post(f"{STORAGE_URL}/update_delivery", data=yaml.safe_dump(update_payload),
+                          headers={"Content-Type":"application/x-yaml"}, timeout=5)
+        storage_ack = yaml.safe_load(r.text) if r.status_code == 200 else {"error": r.text}
+    except Exception as e:
+        storage_ack = {"error": str(e)}
+    send_log("Controller_MS", f"shared update with storage: {storage_ack}")
+
+    # Notify UI
+    try:
+        r = requests.post(f"{UI_URL}/notify", data=yaml.safe_dump({"update": update_payload}),
+                          headers={"Content-Type":"application/x-yaml"}, timeout=5)
+        ui_ack = yaml.safe_load(r.text)
+    except Exception as e:
+        ui_ack = {"error": str(e)}
+    send_log("Controller_MS", f"UI ack for update: {ui_ack}")
+
+    return yaml_response({"ack": ack, "storage_ack": storage_ack, "ui_ack": ui_ack})
+
+if __name__ == "__main__":
+    print("Starting Controller_MS on port 5000")
+    app.run(host="0.0.0.0", port=5000)
+

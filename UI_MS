@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""
+UI_MS (internal) - Server_1
+Port: 5001
+Usage: python ui_ms.py
+"""
+from flask import Flask, request, Response
+import requests, yaml, time
+
+app = Flask("UI_MS")
+
+CONTROLLER_URL = "http://localhost:5000"  # Controller_MS
+SENDER_URL = "http://localhost:6000"      # Sender_MS
+
+def yaml_response(obj, status=200):
+    return Response(yaml.safe_dump(obj), status=status, mimetype="application/x-yaml")
+
+@app.route("/request_delivery", methods=["POST"])
+def request_delivery():
+    """
+    Endpoint user-facing Sender_MS calls. Forward to Controller.
+    """
+    try:
+        data = yaml.safe_load(request.data.decode() or "{}")
+    except Exception:
+        return yaml_response({"error": "invalid yaml"}, status=400)
+    # forward to Controller
+    try:
+        r = requests.post(f"{CONTROLLER_URL}/request_delivery", data=yaml.safe_dump(data),
+                          headers={"Content-Type": "application/x-yaml"}, timeout=10)
+        return Response(r.text, status=r.status_code, mimetype="application/x-yaml")
+    except Exception as e:
+        return yaml_response({"error": "failed contacting Controller_MS", "exception": str(e)}, status=500)
+
+@app.route("/notify", methods=["POST"])
+def notify():
+    """
+    Controller_MS calls here to notify UI about assignment/update. UI forwards to Sender.
+    """
+    try:
+        data = yaml.safe_load(request.data.decode() or "{}")
+    except Exception:
+        return yaml_response({"error": "invalid yaml"}, status=400)
+    # forward to Sender
+    try:
+        r = requests.post(f"{SENDER_URL}/notify", data=yaml.safe_dump(data),
+                          headers={"Content-Type":"application/x-yaml"}, timeout=5)
+        # ack the Controller after sending to Sender
+        ack = {"ui_ack": True, "forwarded_to_sender": r.status_code == 200}
+        return yaml_response(ack)
+    except Exception as e:
+        return yaml_response({"error": "failed contacting Sender_MS", "exception": str(e)}, status=500)
+
+@app.route("/ack_controller", methods=["POST"])
+def ack_controller():
+    """
+    Endpoint Controller calls to receive UI acknowledgement in scenario.
+    """
+    return yaml_response({"ui_ack": True, "time": time.time()})
+
+if __name__ == "__main__":
+    print("Starting UI_MS on port 5001")
+    app.run(host="0.0.0.0", port=5001)
+

@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""
+Sender_MS (external) - Laptop_1
+Port: 6000
+Usage: python sender_ms.py
+"""
+from flask import Flask, request, Response
+import requests, yaml, time
+
+app = Flask("Sender_MS")
+
+# Configure UI_MS location (change hostname/IP if UI runs elsewhere)
+UI_MS_URL = "http://localhost:5001"  # UI_MS
+
+def yaml_response(obj, status=200):
+    return Response(yaml.safe_dump(obj), status=status, mimetype="application/x-yaml")
+
+@app.route("/send_request", methods=["POST"])
+def send_request():
+    """
+    Local endpoint to trigger sending a delivery request to UI_MS.
+    Expected YAML body: {sender: "Alice", parcel: {desc: "..."}}
+    """
+    payload = request.data.decode() or ""
+    try:
+        data = yaml.safe_load(payload) or {}
+    except Exception:
+        return yaml_response({"error": "invalid yaml"}, status=400)
+    # forward to UI_MS /request_delivery
+    try:
+        r = requests.post(f"{UI_MS_URL}/request_delivery", data=yaml.safe_dump(data),
+                          headers={"Content-Type":"application/x-yaml"}, timeout=5)
+        return Response(r.text, status=r.status_code, mimetype="application/x-yaml")
+    except Exception as e:
+        return yaml_response({"error": "failed contacting UI_MS", "exception": str(e)}, status=500)
+
+@app.route("/notify", methods=["POST"])
+def notify():
+    """
+    Receives notifications from UI_MS about assignment/updates.
+    Expected YAML body: {delivery: {...}}
+    """
+    try:
+        data = yaml.safe_load(request.data.decode() or "{}")
+    except Exception:
+        return yaml_response({"error": "invalid yaml"}, status=400)
+    print(f"[Sender_MS] Received notification: {data}")
+    # Acknowledge
+    resp = {"ack": True, "received_at": time.time()}
+    return yaml_response(resp)
+
+if __name__ == "__main__":
+    print("Starting Sender_MS on port 6000")
+    app.run(host="0.0.0.0", port=6000)
+
